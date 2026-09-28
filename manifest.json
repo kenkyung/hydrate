@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "kenkyung.water",
+  "name": "Water reminder",
+  "version": "1.0.0",
+  "author": "kenkyung",
+  "description": "Pops up a water reminder card eight times a day",
+  "kinds": [
+    "service",
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "WaterScheduler.qml",
+    "overlay": "WaterPopup.qml"
+  }
+}
