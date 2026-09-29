@@ -9,10 +9,21 @@ Item {
 
   property var shell: null
   property var manifest: null
+  // The matching WaterScheduler service, injected by the shell when a
+  // service-kind entry point exists alongside the overlay.
+  property var service: null
 
   property bool opened: false
+  property string mode: "normal" // "normal" | "setup" | "settings" | "weight"
+
   property string slotLabel: "preview"
   property int ml: 310
+  property bool countable: false
+  property int drank: 0
+  property int slots: 8
+  property int targetMl: 2475
+  property int snoozeMinutes: 10
+  property string weightInput: ""
 
   readonly property int autoHideMs: 12000
 
@@ -27,13 +38,27 @@ Item {
   readonly property int glassStageHeight: Style.space(88)
   readonly property int columnGap: Style.space(14)
 
+  // Live service state, falling back to the payload captured at summon time.
+  readonly property var liveProgress: service && service.progress ? service.progress : null
+  readonly property int drankNow: liveProgress && isFinite(liveProgress.drank) ? liveProgress.drank : root.drank
+  readonly property int targetNow: liveProgress && isFinite(liveProgress.targetMl) ? liveProgress.targetMl : root.targetMl
+  readonly property int weightNow: service && isFinite(service.weightKg) ? service.weightKg : 75
+  readonly property bool enabledNow: service ? service.enabled === true : true
+
   function open(payloadJson) {
     var payload = ({})
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) { payload = ({}) }
     slotLabel = payload.slot !== undefined ? String(payload.slot) : "preview"
     ml = isFinite(Number(payload.ml)) ? Math.round(Number(payload.ml)) : 310
+    countable = payload.countable === true
+    drank = isFinite(Number(payload.drank)) ? Math.round(Number(payload.drank)) : 0
+    slots = isFinite(Number(payload.slots)) ? Math.round(Number(payload.slots)) : 8
+    targetMl = isFinite(Number(payload.targetMl)) ? Math.round(Number(payload.targetMl)) : 2475
+    snoozeMinutes = isFinite(Number(payload.snoozeMinutes)) ? Math.max(1, Math.round(Number(payload.snoozeMinutes))) : 10
+    weightInput = ""
+    setMode(String(payload.mode) === "setup" ? "setup" : "normal")
     opened = true
-    hideTimer.restart()
+    if (mode === "normal") hideTimer.restart()
     Quickshell.execDetached(["pw-play", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"])
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -48,6 +73,62 @@ Item {
       shell.hide((manifest && manifest.id) || "kenkyung.water")
   }
 
+  function setMode(next) {
+    mode = next
+    if (next === "normal") hideTimer.restart()
+    else hideTimer.stop()
+  }
+
+  function markDrunk() {
+    var label = slotLabel
+    var canCount = countable
+    dismiss()
+    if (service && typeof service.drink === "function")
+      service.drink(label, canCount)
+  }
+
+  function snooze() {
+    var minutes = snoozeMinutes
+    dismiss()
+    if (service && typeof service.snooze === "function")
+      service.snooze(minutes)
+  }
+
+  function editWeight(event) {    if (Util.editsFilter(event, root.weightInput)) {
+      weightInput = Util.editedFilter(event, root.weightInput)
+      return true
+    }
+    if (event.text && /^[0-9]$/.test(event.text) && root.weightInput.length < 3) {
+      weightInput = root.weightInput + event.text
+      return true
+    }
+    return false
+  }
+
+  function submitWeight() {
+    var parsed = parseInt(weightInput, 10)
+    var weight = isFinite(parsed) && parsed >= 20 && parsed <= 400 ? parsed : 0
+    if (!weight) return false
+    if (service && typeof service.setWeightKg === "function")
+      service.setWeightKg(weight)
+    weightInput = ""
+    if (mode === "setup") dismiss()
+    else setMode("settings")
+    return true
+  }
+
+  function useDefaultWeight() {
+    if (service && typeof service.setWeightKg === "function")
+      service.setWeightKg(75)
+    weightInput = ""
+    dismiss()
+  }
+
+  function toggleEnabled() {
+    if (service && typeof service.setEnabled === "function")
+      service.setEnabled(!root.enabledNow)
+  }
+
   Timer {
     id: hideTimer
     interval: root.autoHideMs
@@ -58,8 +139,8 @@ Item {
     id: panel
     visible: root.opened
     color: "transparent"
-    width: card.width
-    height: card.height
+    implicitWidth: card.width
+    implicitHeight: card.height
     WlrLayershell.namespace: "omarchy-water"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
@@ -79,18 +160,23 @@ Item {
 
     BorderSurface {
       id: card
-      width: card.contentLeftInset + root.glassStageWidth + root.columnGap
-             + Math.max(titleText.implicitWidth, amountText.implicitWidth)
+      width: card.contentLeftInset
+             + Math.max(normalRow.implicitWidth, setupColumn.implicitWidth,
+                        settingsColumn.implicitWidth, weightColumn.implicitWidth)
              + card.contentRightInset
-      height: card.contentTopInset + root.glassStageHeight + card.contentBottomInset
+      height: card.contentTopInset
+              + Math.max(normalRow.implicitHeight, setupColumn.implicitHeight,
+                         settingsColumn.implicitHeight, weightColumn.implicitHeight)
+              + card.contentBottomInset
       color: root.cardBackground
       borderSpec: root.borderSpec
       radius: Style.cornerRadius
       padding: Style.spacing.panelPadding
 
       MouseArea {
+        // Swallow clicks so they don't fall through the overlay; the card
+        // itself is dismissed by its buttons, Esc, or the auto-hide timer.
         anchors.fill: parent
-        onClicked: root.dismiss()
       }
 
       Item {
@@ -101,18 +187,34 @@ Item {
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
           if (event.key === Qt.Key_Escape) {
-            root.dismiss()
+            if (root.mode === "weight") root.setMode("settings")
+            else if (root.mode === "settings") root.setMode("normal")
+            else root.dismiss()
             event.accepted = true
+          } else if (root.mode === "setup" || root.mode === "weight") {
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              if (root.submitWeight()) event.accepted = true
+            } else if (root.editWeight(event)) {
+              event.accepted = true
+            }
+          } else if (root.mode === "normal") {
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              root.markDrunk()
+              event.accepted = true
+            } else if (event.key === Qt.Key_S) {
+              root.snooze()
+              event.accepted = true
+            }
           }
         }
       }
 
+      // --------------------------------------------------------- normal
+
       Row {
-        anchors.fill: parent
-        anchors.topMargin: card.contentTopInset
-        anchors.rightMargin: card.contentRightInset
-        anchors.bottomMargin: card.contentBottomInset
-        anchors.leftMargin: card.contentLeftInset
+        id: normalRow
+        visible: root.mode === "normal"
+        anchors.centerIn: parent
         spacing: root.columnGap
 
         Item {
@@ -198,6 +300,265 @@ Item {
             font.family: Style.font.menuFamily
             font.pixelSize: Style.font.heading
           }
+
+          Text {
+            id: progressText
+            textFormat: Text.PlainText
+            text: root.drankNow + " / " + root.slots + " glasses today · "
+                  + Math.round(root.targetNow / 1000 * 10) / 10 + " L goal"
+            color: root.cardForeground
+            opacity: 0.72
+            font.family: Style.font.menuFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Row {
+            id: buttonRow
+            spacing: Style.space(6)
+
+            Button {
+              text: "Drank it"
+              active: true
+              foreground: root.cardForeground
+              accent: root.waterBlue
+              fontSize: Style.font.bodySmall
+              onClicked: root.markDrunk()
+            }
+
+            Button {
+              text: "Snooze " + root.snoozeMinutes + "m"
+              bordered: true
+              foreground: root.cardForeground
+              fontSize: Style.font.bodySmall
+              onClicked: root.snooze()
+            }
+          }
+        }
+      }
+
+      // Settings gear on the normal card.
+      Button {
+        visible: root.mode === "normal"
+        anchors.top: card.top
+        anchors.right: card.right
+        anchors.topMargin: card.contentTopInset
+        anchors.rightMargin: card.contentRightInset
+        text: "⚙"
+        tooltipText: "Settings"
+        foreground: root.cardForeground
+        onClicked: root.setMode("settings")
+      }
+
+      // --------------------------------------------------------- setup
+
+      Column {
+        id: setupColumn
+        visible: root.mode === "setup"
+        anchors.centerIn: parent
+        spacing: Style.space(10)
+
+        Text {
+          textFormat: Text.PlainText
+          text: "Welcome to Water reminder"
+          color: root.cardForeground
+          font.family: Style.font.menuFamily
+          font.pixelSize: Style.font.title
+          font.bold: true
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          text: "How much do you weigh? I'll pour your\n"
+                + "eight daily glasses from that."
+          color: root.cardForeground
+          opacity: 0.8
+          font.family: Style.font.menuFamily
+          font.pixelSize: Style.font.body
+        }
+
+        BorderSurface {
+          color: Util.alpha(root.cardForeground, 0.06)
+          borderSpec: Border.controlSpec("normal", root.cardForeground, root.waterBlue)
+          radius: Style.cornerRadius
+          padding: Style.spacing.controlPaddingX
+          width: Style.space(96)
+          height: Style.space(34)
+
+          Row {
+            anchors.centerIn: parent
+
+            Text {
+              textFormat: Text.PlainText
+              text: root.weightInput + "▌"
+              color: root.cardForeground
+              font.family: Style.font.menuFamily
+              font.pixelSize: Style.font.heading
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              text: " kg"
+              color: root.cardForeground
+              opacity: 0.4
+              font.family: Style.font.menuFamily
+              font.pixelSize: Style.font.heading
+            }
+          }
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          text: "Type your weight and press Enter"
+          color: root.cardForeground
+          opacity: 0.55
+          font.family: Style.font.menuFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        Row {
+          anchors.horizontalCenter: parent.horizontalCenter
+          spacing: Style.space(6)
+
+          Button {
+            text: "Save"
+            active: true
+            foreground: root.cardForeground
+            accent: root.waterBlue
+            onClicked: root.submitWeight()
+          }
+
+          Button {
+            text: "Use default (75 kg)"
+            bordered: true
+            foreground: root.cardForeground
+            onClicked: root.useDefaultWeight()
+          }
+        }
+      }
+
+      // ------------------------------------------------------- settings
+
+      Column {
+        id: settingsColumn
+        visible: root.mode === "settings"
+        anchors.centerIn: parent
+        spacing: Style.space(8)
+
+        Text {
+          textFormat: Text.PlainText
+          text: "Water settings"
+          color: root.cardForeground
+          font.family: Style.font.menuFamily
+          font.pixelSize: Style.font.title
+          font.bold: true
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          text: "Weight: " + root.weightNow + " kg · "
+                + Math.round(root.targetNow / 1000 * 10) / 10 + " L per day"
+          color: root.cardForeground
+          opacity: 0.8
+          font.family: Style.font.menuFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          text: "Reminders: " + (root.enabledNow ? "On" : "Off")
+          color: root.cardForeground
+          opacity: 0.8
+          font.family: Style.font.menuFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Column {
+          anchors.horizontalCenter: parent.horizontalCenter
+          spacing: Style.space(6)
+
+          Button {
+            width: Style.space(150)
+            text: "Change weight"
+            bordered: true
+            foreground: root.cardForeground
+            onClicked: root.setMode("weight")
+          }
+
+          Button {
+            width: Style.space(150)
+            text: root.enabledNow ? "Disable reminders" : "Enable reminders"
+            bordered: true
+            foreground: root.cardForeground
+            onClicked: root.toggleEnabled()
+          }
+        }
+      }
+
+      // -------------------------------------------------------- weight
+
+      Column {
+        id: weightColumn
+        visible: root.mode === "weight"
+        anchors.centerIn: parent
+        spacing: Style.space(10)
+
+        Text {
+          textFormat: Text.PlainText
+          text: "Change weight"
+          color: root.cardForeground
+          font.family: Style.font.menuFamily
+          font.pixelSize: Style.font.title
+          font.bold: true
+        }
+
+        BorderSurface {
+          color: Util.alpha(root.cardForeground, 0.06)
+          borderSpec: Border.controlSpec("normal", root.cardForeground, root.waterBlue)
+          radius: Style.cornerRadius
+          padding: Style.spacing.controlPaddingX
+          width: Style.space(96)
+          height: Style.space(34)
+
+          Row {
+            anchors.centerIn: parent
+
+            Text {
+              textFormat: Text.PlainText
+              text: root.weightInput + "▌"
+              color: root.cardForeground
+              font.family: Style.font.menuFamily
+              font.pixelSize: Style.font.heading
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              text: " kg"
+              color: root.cardForeground
+              opacity: 0.4
+              font.family: Style.font.menuFamily
+              font.pixelSize: Style.font.heading
+            }
+          }
+        }
+
+        Row {
+          anchors.horizontalCenter: parent.horizontalCenter
+          spacing: Style.space(6)
+
+          Button {
+            text: "Save"
+            active: true
+            foreground: root.cardForeground
+            accent: root.waterBlue
+            onClicked: root.submitWeight()
+          }
+
+          Button {
+            text: "Cancel"
+            bordered: true
+            foreground: root.cardForeground
+            onClicked: root.setMode("settings")
+          }
         }
       }
     }
@@ -205,7 +566,7 @@ Item {
 
   SequentialAnimation {
     id: shake
-    running: root.opened
+    running: root.opened && root.mode === "normal"
     loops: Animation.Infinite
 
     NumberAnimation { target: glass; property: "rotation"; from: 0; to: -8; duration: 110; easing.type: Easing.InOutQuad }
