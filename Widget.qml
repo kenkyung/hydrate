@@ -42,7 +42,9 @@ BarWidget {
       drank: root.drank,
       slots: root.slotsTotal,
       targetMl: root.targetMl,
-      snoozeMinutes: service.defaultSnoozeMinutes
+      snoozeMinutes: service.defaultSnoozeMinutes,
+      // First-run users get the setup card, same as a scheduled fire would.
+      mode: service.configured === false ? "setup" : "normal"
     })
     bar.shell.toggle("kenkyung.water", payload)
   }

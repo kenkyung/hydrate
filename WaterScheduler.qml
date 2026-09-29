@@ -53,6 +53,9 @@ Item {
   property bool snoozePending: false
   property double snoozeFireAtMs: 0
   property string snoozeLabel: ""
+  // Whether the snoozed fire counts toward the daily goal. Manual bar opens
+  // are not countable, and their snoozed re-fire must stay non-countable.
+  property bool snoozeCountable: true
 
   // Live snapshot for bar widgets to bind to. Reassigned as a whole object so
   // QML bindings re-evaluate on every change.
@@ -236,11 +239,18 @@ Item {
     }
   }
 
-  function snooze(minutes) {
+  // Snoozes the slot the open popup was fired for. The popup passes its own
+  // label and countability; without them we fall back to the most recently
+  // targeted slot. (Using nextSlotLabel blindly was wrong: fire() advances
+  // the schedule right after summoning, so the label had already moved on
+  // to the following slot by the time the user pressed Snooze.)
+  function snooze(minutes, label, countable) {
     var m = Math.max(1, Math.round(Number(minutes) || defaultSnoozeMinutes))
     root.snoozePending = true
     root.snoozeFireAtMs = Date.now() + m * 60 * 1000
-    root.snoozeLabel = root.nextSlotLabel || "later"
+    root.snoozeLabel = (label !== undefined && String(label)) ? String(label)
+                                                              : (root.nextSlotLabel || "later")
+    root.snoozeCountable = countable !== false
     console.log("kenkyung.water: snoozed", root.snoozeLabel, "for", m, "min")
     scheduleNext()
   }
@@ -318,9 +328,10 @@ Item {
     }
     if (snoozePending) {
       var label = snoozeLabel
+      var canCount = snoozeCountable
       snoozePending = false
       snoozeFireAtMs = 0
-      summon(label, slotMl, true)
+      summon(label, slotMl, canCount)
       scheduleNext()
       return
     }
@@ -412,6 +423,7 @@ Item {
       root.enabled = true
       root.countedByDay = ({})
       root.snoozePending = false
+      root.snoozeCountable = true
       root.lastSlotTargetMs = 0
       scheduleStateSave()
       updateProgress()

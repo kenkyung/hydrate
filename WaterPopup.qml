@@ -24,14 +24,16 @@ Item {
   property int targetMl: 2475
   property int snoozeMinutes: 10
   property string weightInput: ""
+  property string weightError: ""
 
   readonly property int autoHideMs: 12000
 
   readonly property color cardBackground: Util.alpha(Color.popups.background, 0.97)
   readonly property color cardForeground: Color.popups.text
   // Themes define no blue role, so the water is a fixed blue that reads well
-  // against any popup background.
+  // against any popup background. Same rationale for the validation red.
   readonly property color waterBlue: "#6cb2f2"
+  readonly property color errorRed: "#e06c75"
   readonly property var borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
 
   readonly property int glassStageWidth: Style.space(64)
@@ -44,6 +46,9 @@ Item {
   readonly property int targetNow: liveProgress && isFinite(liveProgress.targetMl) ? liveProgress.targetMl : root.targetMl
   readonly property int weightNow: service && isFinite(service.weightKg) ? service.weightKg : 75
   readonly property bool enabledNow: service ? service.enabled === true : true
+  // Glass fill mirrors today's progress, kept just above empty so the glass
+  // still reads as a glass at 0/8.
+  readonly property real fillRatio: Math.max(0.05, Math.min(1.0, root.drankNow / Math.max(1, root.slots)))
 
   function open(payloadJson) {
     var payload = ({})
@@ -56,10 +61,16 @@ Item {
     targetMl = isFinite(Number(payload.targetMl)) ? Math.round(Number(payload.targetMl)) : 2475
     snoozeMinutes = isFinite(Number(payload.snoozeMinutes)) ? Math.max(1, Math.round(Number(payload.snoozeMinutes))) : 10
     weightInput = ""
+    weightError = ""
     setMode(String(payload.mode) === "setup" ? "setup" : "normal")
     opened = true
-    if (mode === "normal") hideTimer.restart()
-    Quickshell.execDetached(["pw-play", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"])
+    card.opacity = 0
+    card.scale = 0.96
+    enterAnim.restart()
+    // Only real reminder fires make noise; bar clicks and IPC previews are
+    // user-initiated and stay silent.
+    if (countable)
+      Quickshell.execDetached(["pw-play", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"])
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -89,17 +100,22 @@ Item {
 
   function snooze() {
     var minutes = snoozeMinutes
+    var label = slotLabel
+    var canCount = countable
     dismiss()
     if (service && typeof service.snooze === "function")
-      service.snooze(minutes)
+      service.snooze(minutes, label, canCount)
   }
 
-  function editWeight(event) {    if (Util.editsFilter(event, root.weightInput)) {
+  function editWeight(event) {
+    if (Util.editsFilter(event, root.weightInput)) {
       weightInput = Util.editedFilter(event, root.weightInput)
+      weightError = ""
       return true
     }
     if (event.text && /^[0-9]$/.test(event.text) && root.weightInput.length < 3) {
       weightInput = root.weightInput + event.text
+      weightError = ""
       return true
     }
     return false
@@ -108,7 +124,11 @@ Item {
   function submitWeight() {
     var parsed = parseInt(weightInput, 10)
     var weight = isFinite(parsed) && parsed >= 20 && parsed <= 400 ? parsed : 0
-    if (!weight) return false
+    if (!weight) {
+      weightError = "Enter a weight from 20 to 400 kg"
+      return false
+    }
+    weightError = ""
     if (service && typeof service.setWeightKg === "function")
       service.setWeightKg(weight)
     weightInput = ""
@@ -121,12 +141,58 @@ Item {
     if (service && typeof service.setWeightKg === "function")
       service.setWeightKg(75)
     weightInput = ""
+    weightError = ""
     dismiss()
   }
 
   function toggleEnabled() {
     if (service && typeof service.setEnabled === "function")
       service.setEnabled(!root.enabledNow)
+  }
+
+  // Weight entry box plus its validation message, shared by the setup and
+  // change-weight cards.
+  component WeightField: Column {
+    spacing: Style.space(4)
+
+    BorderSurface {
+      color: Util.alpha(root.cardForeground, 0.06)
+      borderSpec: Border.controlSpec("normal", root.cardForeground, root.waterBlue)
+      radius: Style.cornerRadius
+      padding: Style.spacing.controlPaddingX
+      width: Style.space(96)
+      height: Style.space(34)
+
+      Row {
+        anchors.centerIn: parent
+
+        Text {
+          textFormat: Text.PlainText
+          text: root.weightInput + "▌"
+          color: root.weightError.length > 0 ? root.errorRed : root.cardForeground
+          font.family: Style.font.menuFamily
+          font.pixelSize: Style.font.heading
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          text: " kg"
+          color: root.cardForeground
+          opacity: 0.4
+          font.family: Style.font.menuFamily
+          font.pixelSize: Style.font.heading
+        }
+      }
+    }
+
+    Text {
+      visible: root.weightError.length > 0
+      textFormat: Text.PlainText
+      text: root.weightError
+      color: root.errorRed
+      font.family: Style.font.menuFamily
+      font.pixelSize: Style.font.bodySmall
+    }
   }
 
   Timer {
@@ -173,10 +239,20 @@ Item {
       radius: Style.cornerRadius
       padding: Style.spacing.panelPadding
 
+      ParallelAnimation {
+        id: enterAnim
+        NumberAnimation { target: card; property: "opacity"; to: 1; duration: 160; easing.type: Easing.OutCubic }
+        NumberAnimation { target: card; property: "scale"; to: 1; duration: 200; easing.type: Easing.OutCubic }
+      }
+
       MouseArea {
         // Swallow clicks so they don't fall through the overlay; the card
         // itself is dismissed by its buttons, Esc, or the auto-hide timer.
+        // Hovering pauses the auto-hide so the card never vanishes mid-read.
         anchors.fill: parent
+        hoverEnabled: true
+        onEntered: hideTimer.stop()
+        onExited: if (root.opened && root.mode === "normal") hideTimer.restart()
       }
 
       Item {
@@ -242,11 +318,17 @@ Item {
               clip: true
 
               Rectangle {
+                id: water
                 anchors.bottom: parent.bottom
                 anchors.horizontalCenter: parent.horizontalCenter
                 width: parent.width - parent.border.width * 2
-                height: parent.height * 0.68 - parent.border.width
+                height: Math.max(Style.space(2),
+                                 (parent.height - parent.border.width * 2) * root.fillRatio)
                 color: root.waterBlue
+
+                Behavior on height {
+                  NumberAnimation { duration: 450; easing.type: Easing.OutCubic }
+                }
 
                 Rectangle {
                   anchors.top: parent.top
@@ -313,8 +395,33 @@ Item {
           }
 
           Row {
+            id: progressDots
+            spacing: Style.space(4)
+            topPadding: Style.space(2)
+
+            Repeater {
+              model: root.slots
+
+              Rectangle {
+                width: Style.space(6)
+                height: Style.space(6)
+                radius: width / 2
+                color: index < root.drankNow ? root.waterBlue : "transparent"
+                border.width: 1
+                border.color: index < root.drankNow ? root.waterBlue
+                                                    : Util.alpha(root.cardForeground, 0.35)
+
+                Behavior on color {
+                  ColorAnimation { duration: 250 }
+                }
+              }
+            }
+          }
+
+          Row {
             id: buttonRow
             spacing: Style.space(6)
+            topPadding: Style.space(4)
 
             Button {
               text: "Drank it"
@@ -332,6 +439,16 @@ Item {
               fontSize: Style.font.bodySmall
               onClicked: root.snooze()
             }
+          }
+
+          Text {
+            id: hintText
+            textFormat: Text.PlainText
+            text: "Enter drank · S snooze · Esc dismiss"
+            color: root.cardForeground
+            opacity: 0.38
+            font.family: Style.font.menuFamily
+            font.pixelSize: Style.font.bodySmall
           }
         }
       }
@@ -376,35 +493,7 @@ Item {
           font.pixelSize: Style.font.body
         }
 
-        BorderSurface {
-          color: Util.alpha(root.cardForeground, 0.06)
-          borderSpec: Border.controlSpec("normal", root.cardForeground, root.waterBlue)
-          radius: Style.cornerRadius
-          padding: Style.spacing.controlPaddingX
-          width: Style.space(96)
-          height: Style.space(34)
-
-          Row {
-            anchors.centerIn: parent
-
-            Text {
-              textFormat: Text.PlainText
-              text: root.weightInput + "▌"
-              color: root.cardForeground
-              font.family: Style.font.menuFamily
-              font.pixelSize: Style.font.heading
-            }
-
-            Text {
-              textFormat: Text.PlainText
-              text: " kg"
-              color: root.cardForeground
-              opacity: 0.4
-              font.family: Style.font.menuFamily
-              font.pixelSize: Style.font.heading
-            }
-          }
-        }
+        WeightField {}
 
         Text {
           textFormat: Text.PlainText
@@ -491,6 +580,15 @@ Item {
             foreground: root.cardForeground
             onClicked: root.toggleEnabled()
           }
+
+          Button {
+            width: Style.space(150)
+            text: "Done"
+            active: true
+            foreground: root.cardForeground
+            accent: root.waterBlue
+            onClicked: root.setMode("normal")
+          }
         }
       }
 
@@ -511,35 +609,7 @@ Item {
           font.bold: true
         }
 
-        BorderSurface {
-          color: Util.alpha(root.cardForeground, 0.06)
-          borderSpec: Border.controlSpec("normal", root.cardForeground, root.waterBlue)
-          radius: Style.cornerRadius
-          padding: Style.spacing.controlPaddingX
-          width: Style.space(96)
-          height: Style.space(34)
-
-          Row {
-            anchors.centerIn: parent
-
-            Text {
-              textFormat: Text.PlainText
-              text: root.weightInput + "▌"
-              color: root.cardForeground
-              font.family: Style.font.menuFamily
-              font.pixelSize: Style.font.heading
-            }
-
-            Text {
-              textFormat: Text.PlainText
-              text: " kg"
-              color: root.cardForeground
-              opacity: 0.4
-              font.family: Style.font.menuFamily
-              font.pixelSize: Style.font.heading
-            }
-          }
-        }
+        WeightField {}
 
         Row {
           anchors.horizontalCenter: parent.horizontalCenter
